@@ -347,6 +347,91 @@ app.get("/api/trips/:tripId/members", (req, res) => {
   );
 });
 
+// Debt Simplification Algorithm (Min-Cash Flow)
+app.get('/api/trips/:tripId/settlements', (req, res) => {
+  const { tripId } = req.params;
+  
+  // Get all expenses and splits for the trip
+  db.all(
+    `SELECT e.*, es.user_id, es.amount as split_amount FROM expenses e
+     INNER JOIN expense_splits es ON e.id = es.expense_id
+     WHERE e.trip_id = ?`,
+    [tripId],
+    (err, rows) => {
+      if (err) {
+        return res.status(500).json({ error: err.message });
+      }
+      
+      // Calculate net balance for each user
+      const balances = {};
+      
+      rows.forEach(row => {
+        const paidBy = row.paid_by;
+        const splitBy = row.user_id;
+        const amount = parseFloat(row.split_amount);
+        
+        // Person who paid gets credited
+        if (!balances[paidBy]) balances[paidBy] = 0;
+        balances[paidBy] += amount;
+        
+        // Person who split owes
+        if (!balances[splitBy]) balances[splitBy] = 0;
+        balances[splitBy] -= amount;
+      });
+      
+      // Simplify debts using Min-Cash Flow algorithm
+      const settlements = simplifyDebts(balances);
+      
+      res.json(settlements);
+    }
+  );
+});
+
+function simplifyDebts(balances) {
+  const settlements = [];
+  const creditors = [];
+  const debtors = [];
+  
+  // Separate creditors and debtors
+  Object.keys(balances).forEach(userId => {
+    const balance = balances[userId];
+    if (balance > 0.01) {
+      creditors.push({ userId, amount: balance });
+    } else if (balance < -0.01) {
+      debtors.push({ userId, amount: Math.abs(balance) });
+    }
+  });
+  
+  // Sort by amount (largest first)
+  creditors.sort((a, b) => b.amount - a.amount);
+  debtors.sort((a, b) => b.amount - a.amount);
+  
+  // Greedy algorithm to minimize transactions
+  let i = 0, j = 0;
+  
+  while (i < creditors.length && j < debtors.length) {
+    const creditor = creditors[i];
+    const debtor = debtors[j];
+    
+    const amount = Math.min(creditor.amount, debtor.amount);
+    
+    if (amount > 0.01) {
+      settlements.push({
+        from: debtor.userId,
+        to: creditor.userId,
+        amount: parseFloat(amount.toFixed(2))
+      });
+    }
+    
+    creditor.amount -= amount;
+    debtor.amount -= amount;
+    
+    if (creditor.amount < 0.01) i++;
+    if (debtor.amount < 0.01) j++;
+  }
+  
+  return settlements;
+}
 // Activities
 app.post("/api/trips/:tripId/activities", (req, res) => {
   const { tripId } = req.params;
@@ -497,78 +582,100 @@ app.get("/api/trips/:tripId/settlements", (req, res) => {
       if (err) {
         return res.status(500).json({ error: err.message });
       }
+      emitToTrip(activity.trip_id, 'activity-deleted', { id: req.params.id });
+      res.json({ success: true });
+    });
+  });
+});
 
-      // Calculate net balance for each user
-      const balances = {};
-
-      rows.forEach((row) => {
-        const paidBy = row.paid_by;
-        const splitBy = row.user_id;
-        const amount = parseFloat(row.split_amount);
-
-        // Person who paid gets credited
-        if (!balances[paidBy]) balances[paidBy] = 0;
-        balances[paidBy] += amount;
-
-        // Person who split owes
-        if (!balances[splitBy]) balances[splitBy] = 0;
-        balances[splitBy] -= amount;
+// Expenses
+app.post('/api/trips/:tripId/expenses', (req, res) => {
+  const { tripId } = req.params;
+  const { description, amount, currency, paid_by, date, splits } = req.body;
+  const expenseId = uuidv4();
+  
+  db.run(
+    `INSERT INTO expenses (id, trip_id, description, amount, currency, paid_by, date)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [expenseId, tripId, description, amount, currency || 'USD', paid_by, date],
+    function(err) {
+      if (err) {
+        return res.status(400).json({ error: err.message });
+      }
+      
+      // Insert expense splits
+      const splitPromises = splits.map(split => {
+        return new Promise((resolve, reject) => {
+          const splitId = uuidv4();
+          db.run(
+            'INSERT INTO expense_splits (id, expense_id, user_id, amount, percentage) VALUES (?, ?, ?, ?, ?)',
+            [splitId, expenseId, split.user_id, split.amount, split.percentage || null],
+            (err) => {
+              if (err) reject(err);
+              else resolve();
+            }
+          );
+        });
       });
-
-      // Simplify debts using Min-Cash Flow algorithm
-      const settlements = simplifyDebts(balances);
-
-      res.json(settlements);
+      
+      Promise.all(splitPromises).then(() => {
+        emitToTrip(tripId, 'expense-added', { id: expenseId, description, amount, currency, paid_by, date, splits });
+        res.json({ id: expenseId, description, amount, currency, paid_by, date, splits });
+      }).catch(err => {
+        res.status(400).json({ error: err.message });
+      });
     }
   );
 });
 
-function simplifyDebts(balances) {
-  const settlements = [];
-  const creditors = [];
-  const debtors = [];
-
-  // Separate creditors and debtors
-  Object.keys(balances).forEach((userId) => {
-    const balance = balances[userId];
-    if (balance > 0.01) {
-      creditors.push({ userId, amount: balance });
-    } else if (balance < -0.01) {
-      debtors.push({ userId, amount: Math.abs(balance) });
+app.get('/api/trips/:tripId/expenses', (req, res) => {
+  db.all(
+    `SELECT e.*, u.name as paid_by_name FROM expenses e
+     INNER JOIN users u ON e.paid_by = u.id
+     WHERE e.trip_id = ? ORDER BY e.date DESC`,
+    [req.params.tripId],
+    (err, expenses) => {
+      if (err) {
+        return res.status(500).json({ error: err.message });
+      }
+      
+      // Get splits for each expense
+      const expenseIds = expenses.map(e => e.id);
+      if (expenseIds.length === 0) {
+        return res.json([]);
+      }
+      
+      const placeholders = expenseIds.map(() => '?').join(',');
+      db.all(
+        `SELECT es.*, u.name as user_name FROM expense_splits es
+         INNER JOIN users u ON es.user_id = u.id
+         WHERE es.expense_id IN (${placeholders})`,
+        expenseIds,
+        (err, splits) => {
+          if (err) {
+            return res.status(500).json({ error: err.message });
+          }
+          
+          const splitsByExpense = {};
+          splits.forEach(split => {
+            if (!splitsByExpense[split.expense_id]) {
+              splitsByExpense[split.expense_id] = [];
+            }
+            splitsByExpense[split.expense_id].push(split);
+          });
+          
+          const expensesWithSplits = expenses.map(expense => ({
+            ...expense,
+            splits: splitsByExpense[expense.id] || []
+          }));
+          
+          res.json(expensesWithSplits);
+        }
+      );
     }
-  });
+  );
+});
 
-  // Sort by amount (largest first)
-  creditors.sort((a, b) => b.amount - a.amount);
-  debtors.sort((a, b) => b.amount - a.amount);
-
-  // Greedy algorithm to minimize transactions
-  let i = 0,
-    j = 0;
-
-  while (i < creditors.length && j < debtors.length) {
-    const creditor = creditors[i];
-    const debtor = debtors[j];
-
-    const amount = Math.min(creditor.amount, debtor.amount);
-
-    if (amount > 0.01) {
-      settlements.push({
-        from: debtor.userId,
-        to: creditor.userId,
-        amount: parseFloat(amount.toFixed(2)),
-      });
-    }
-
-    creditor.amount -= amount;
-    debtor.amount -= amount;
-
-    if (creditor.amount < 0.01) i++;
-    if (debtor.amount < 0.01) j++;
-  }
-
-  return settlements;
-}
 // User balances
 app.get("/api/trips/:tripId/balances", (req, res) => {
   const { tripId } = req.params;
